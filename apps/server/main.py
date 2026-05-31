@@ -118,6 +118,10 @@ def _estimate_spacing(levels: Sequence[float], fallback: float) -> float:
     return float(median(valid_gaps))
 
 
+def _hamming_distance(a: Sequence[int], b: Sequence[int]) -> int:
+    return sum(int(left != right) for left, right in zip(a, b))
+
+
 def _extract_dot_candidates(binary: np.ndarray) -> List[DotCandidate]:
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candidates: List[DotCandidate] = []
@@ -206,51 +210,51 @@ def _cluster_cells(candidates: List[DotCandidate], dot_diameter: float) -> List[
     return clusters
 
 
-def _quadrant_pattern(
+def _decode_cluster_pattern(
     dots: List[DotCandidate],
     dot_diameter: float,
-) -> Tuple[Tuple[int, int, int, int, int, int], List[int]]:
+) -> Tuple[Tuple[int, int, int, int, int, int], List[int], str]:
+    anchor_dot = min(dots, key=lambda dot: (dot.y, dot.x))
+    anchor_x, anchor_y = anchor_dot.center
+    row_step = 2.5 * dot_diameter
+    col_step = 2.5 * dot_diameter
+    match_radius = 1.2 * dot_diameter
+
+    theoretical_points = [
+        (anchor_x, anchor_y),
+        (anchor_x, anchor_y + row_step),
+        (anchor_x, anchor_y + (2.0 * row_step)),
+        (anchor_x + col_step, anchor_y),
+        (anchor_x + col_step, anchor_y + row_step),
+        (anchor_x + col_step, anchor_y + (2.0 * row_step)),
+    ]
+
+    pattern = [0, 0, 0, 0, 0, 0]
+    for index, (target_x, target_y) in enumerate(theoretical_points):
+        for dot in dots:
+            center_x, center_y = dot.center
+            if float(np.hypot(center_x - target_x, center_y - target_y)) <= match_radius:
+                pattern[index] = 1
+                break
+
+    pattern_tuple = tuple(pattern)
+    translation = GRADE_1_MAP.get(pattern_tuple, "")
+    if not translation:
+        best_pattern = min(
+            GRADE_1_MAP.keys(),
+            key=lambda candidate: _hamming_distance(pattern_tuple, candidate),
+        )
+        pattern_tuple = best_pattern
+        translation = GRADE_1_MAP[best_pattern]
+
     min_x = min(dot.x for dot in dots)
     min_y = min(dot.y for dot in dots)
     max_x = max(dot.x + dot.w for dot in dots)
     max_y = max(dot.y + dot.h for dot in dots)
-
-    pad_x = dot_diameter * 0.55
-    pad_y = dot_diameter * 0.55
-
-    anchor_x1 = min_x - pad_x
-    anchor_y1 = min_y - pad_y
-    anchor_x2 = max_x + pad_x
-    anchor_y2 = max_y + pad_y
-
-    min_anchor_width = dot_diameter * 2.6
-    min_anchor_height = dot_diameter * 4.0
-
-    current_width = anchor_x2 - anchor_x1
-    current_height = anchor_y2 - anchor_y1
-    if current_width < min_anchor_width:
-        width_delta = (min_anchor_width - current_width) / 2.0
-        anchor_x1 -= width_delta
-        anchor_x2 += width_delta
-    if current_height < min_anchor_height:
-        height_delta = (min_anchor_height - current_height) / 2.0
-        anchor_y1 -= height_delta
-        anchor_y2 += height_delta
-
-    x_edges = np.linspace(anchor_x1, anchor_x2, 3)
-    y_edges = np.linspace(anchor_y1, anchor_y2, 4)
-    pattern = [0, 0, 0, 0, 0, 0]
-
-    for col in range(2):
-        for row in range(3):
-            quadrant = (
-                float(x_edges[col]),
-                float(y_edges[row]),
-                float(x_edges[col + 1]),
-                float(y_edges[row + 1]),
-            )
-            if any(_intersects(dot, quadrant) for dot in dots):
-                pattern[row + col * 3] = 1
+    anchor_x1 = min(min_x, anchor_x - match_radius)
+    anchor_y1 = min(min_y, anchor_y - match_radius)
+    anchor_x2 = max(max_x, anchor_x + col_step + match_radius)
+    anchor_y2 = max(max_y, anchor_y + (2.0 * row_step) + match_radius)
 
     box = [
         max(0, int(round(anchor_x1))),
@@ -258,14 +262,14 @@ def _quadrant_pattern(
         max(1, int(round(anchor_x2 - anchor_x1))),
         max(1, int(round(anchor_y2 - anchor_y1))),
     ]
-    return tuple(pattern), box
+    return pattern_tuple, box, translation
 
 
 def _build_cells(candidates: List[DotCandidate]) -> Tuple[str, float, List[List[int]]]:
     if len(candidates) < 1:
         return "", 0.0, []
 
-    dot_diameter = float(np.mean([max(dot.w, dot.h) for dot in candidates]))
+    dot_diameter = float(np.mean([dot.w for dot in candidates]))
     cell_clusters = _cluster_cells(candidates, dot_diameter)
     if not cell_clusters:
         return "", 0.0, []
@@ -305,8 +309,7 @@ def _build_cells(candidates: List[DotCandidate]) -> Tuple[str, float, List[List[
         previous_right_edge: float | None = None
 
         for cluster in line_clusters:
-            pattern, anchor_box = _quadrant_pattern(cluster, dot_diameter)
-            translated = GRADE_1_MAP.get(pattern, "?")
+            pattern, anchor_box, translated = _decode_cluster_pattern(cluster, dot_diameter)
 
             cluster_left = min(dot.x for dot in cluster)
             cluster_right = max(dot.x + dot.w for dot in cluster)
@@ -319,11 +322,11 @@ def _build_cells(candidates: List[DotCandidate]) -> Tuple[str, float, List[List[
             ordered_boxes.append(anchor_box)
 
             occupancy_score = sum(pattern) / 6.0
-            dictionary_score = 1.0 if translated != "?" else 0.3
+            exact_match_score = 1.0 if pattern in GRADE_1_MAP else 0.65
             geometry_score = float(np.mean([dot.circularity for dot in cluster]))
             cluster_confidence = min(
                 1.0,
-                0.2 + occupancy_score * 0.35 + dictionary_score * 0.25 + geometry_score * 0.2,
+                0.2 + occupancy_score * 0.35 + exact_match_score * 0.25 + geometry_score * 0.2,
             )
             confidences.append(cluster_confidence)
 
