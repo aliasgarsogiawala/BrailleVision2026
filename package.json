@@ -1,0 +1,14 @@
+{
+  "name": "braillevision",
+  "private": true,
+  "workspaces": [
+    "apps/web"
+  ],
+  "scripts": {
+    "dev:web": "npm --workspace apps/web run dev",
+    "build:web": "npm --workspace apps/web run build",
+    "start:web": "npm --workspace apps/web run start",
+    "lint:web": "npm --workspace apps/web run lint",
+    "dev:server": "uvicorn apps.server.main:app --host 0.0.0.0 --port 8000 --reload"
+  }
+}
