@@ -8,7 +8,7 @@ type VisionResponse = {
   boxes: number[][];
 };
 
-const API_URL = "http://localhost:8000/api/v1/process-frame";
+const BACKEND_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const PROCESS_WIDTH = 1280;
 const PROCESS_HEIGHT = 720;
 const ROI_TOP_PERCENT = 18;
@@ -158,7 +158,7 @@ export function CameraVision() {
       const formData = new FormData();
       formData.append("file", blob, "capture.jpg");
 
-      const response = await fetch(API_URL, {
+      const response = await fetch(`${BACKEND_URL}/api/v1/process-frame`, {
         method: "POST",
         body: formData,
       });
