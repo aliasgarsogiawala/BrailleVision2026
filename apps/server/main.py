@@ -68,6 +68,7 @@ class DotCandidate:
     h: int
     area: float
     circularity: float
+    contrast: float
 
     @property
     def center(self) -> Tuple[float, float]:
@@ -122,13 +123,13 @@ def _hamming_distance(a: Sequence[int], b: Sequence[int]) -> int:
     return sum(int(left != right) for left, right in zip(a, b))
 
 
-def _extract_dot_candidates(binary: np.ndarray) -> List[DotCandidate]:
+def _extract_dot_candidates(binary: np.ndarray, grayscale: np.ndarray) -> List[DotCandidate]:
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candidates: List[DotCandidate] = []
 
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < 5 or area > 150:
+        if area < 5 or area > 80:
             continue
 
         perimeter = cv2.arcLength(contour, True)
@@ -147,6 +148,26 @@ def _extract_dot_candidates(binary: np.ndarray) -> List[DotCandidate]:
         if aspect_ratio < 0.8 or aspect_ratio > 1.2:
             continue
 
+        contour_mask = np.zeros(grayscale.shape, dtype=np.uint8)
+        cv2.drawContours(contour_mask, [contour], -1, 255, thickness=-1)
+        contour_pixels = grayscale[contour_mask == 255]
+        if contour_pixels.size == 0:
+            continue
+
+        ring_mask = np.zeros(grayscale.shape, dtype=np.uint8)
+        cv2.circle(
+            ring_mask,
+            (int(x + w / 2), int(y + h / 2)),
+            int(max(w, h) * 1.4),
+            255,
+            thickness=-1,
+        )
+        ring_mask = cv2.subtract(ring_mask, contour_mask)
+        ring_pixels = grayscale[ring_mask == 255]
+        local_background = float(np.mean(ring_pixels)) if ring_pixels.size else float(np.mean(grayscale))
+        local_foreground = float(np.mean(contour_pixels))
+        contrast = max(0.0, local_background - local_foreground)
+
         candidates.append(
             DotCandidate(
                 x=int(x),
@@ -155,6 +176,7 @@ def _extract_dot_candidates(binary: np.ndarray) -> List[DotCandidate]:
                 h=int(h),
                 area=float(area),
                 circularity=circularity,
+                contrast=contrast,
             )
         )
 
@@ -309,6 +331,12 @@ def _build_cells(candidates: List[DotCandidate]) -> Tuple[str, float, List[List[
         previous_right_edge: float | None = None
 
         for cluster in line_clusters:
+            if len(cluster) == 1:
+                lone_dot = cluster[0]
+                if lone_dot.circularity < 0.88 or lone_dot.contrast < 18.0:
+                    previous_right_edge = max(lone_dot.x + lone_dot.w, previous_right_edge or 0.0)
+                    continue
+
             pattern, anchor_box, translated = _decode_cluster_pattern(cluster, dot_diameter)
 
             cluster_left = min(dot.x for dot in cluster)
@@ -324,9 +352,14 @@ def _build_cells(candidates: List[DotCandidate]) -> Tuple[str, float, List[List[
             occupancy_score = sum(pattern) / 6.0
             exact_match_score = 1.0 if pattern in GRADE_1_MAP else 0.65
             geometry_score = float(np.mean([dot.circularity for dot in cluster]))
+            contrast_score = min(1.0, float(np.mean([dot.contrast for dot in cluster])) / 32.0)
             cluster_confidence = min(
                 1.0,
-                0.2 + occupancy_score * 0.35 + exact_match_score * 0.25 + geometry_score * 0.2,
+                0.15
+                + occupancy_score * 0.3
+                + exact_match_score * 0.2
+                + geometry_score * 0.2
+                + contrast_score * 0.15,
             )
             confidences.append(cluster_confidence)
 
@@ -358,10 +391,10 @@ def process_braille_frame(frame: np.ndarray) -> Tuple[str, float, List[List[int]
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
         51,
-        10,
+        4,
     )
 
-    candidates = _extract_dot_candidates(thresholded)
+    candidates = _extract_dot_candidates(thresholded, normalized_contrast)
     text, confidence, roi_boxes = _build_cells(candidates)
 
     mapped_boxes = [
