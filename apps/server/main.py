@@ -158,122 +158,178 @@ def _extract_dot_candidates(binary: np.ndarray) -> List[DotCandidate]:
     return candidates
 
 
+def _intersects(dot: DotCandidate, quadrant: Tuple[float, float, float, float]) -> bool:
+    qx1, qy1, qx2, qy2 = quadrant
+    dx1 = float(dot.x)
+    dy1 = float(dot.y)
+    dx2 = float(dot.x + dot.w)
+    dy2 = float(dot.y + dot.h)
+    return dx1 < qx2 and dx2 > qx1 and dy1 < qy2 and dy2 > qy1
+
+
+def _cluster_cells(candidates: List[DotCandidate], dot_diameter: float) -> List[List[DotCandidate]]:
+    if not candidates:
+        return []
+
+    horizontal_threshold = max(dot_diameter * 2.5, 10.0)
+    vertical_threshold = max(dot_diameter * 3.5, 14.0)
+    visited = [False] * len(candidates)
+    clusters: List[List[DotCandidate]] = []
+
+    for start_index in range(len(candidates)):
+        if visited[start_index]:
+            continue
+
+        queue = [start_index]
+        visited[start_index] = True
+        component: List[DotCandidate] = []
+
+        while queue:
+            index = queue.pop()
+            current = candidates[index]
+            component.append(current)
+            current_x, current_y = current.center
+
+            for neighbor_index, neighbor in enumerate(candidates):
+                if visited[neighbor_index]:
+                    continue
+                neighbor_x, neighbor_y = neighbor.center
+                if (
+                    abs(neighbor_x - current_x) <= horizontal_threshold
+                    and abs(neighbor_y - current_y) <= vertical_threshold
+                ):
+                    visited[neighbor_index] = True
+                    queue.append(neighbor_index)
+
+        clusters.append(sorted(component, key=lambda dot: (dot.y, dot.x)))
+
+    return clusters
+
+
+def _quadrant_pattern(
+    dots: List[DotCandidate],
+    dot_diameter: float,
+) -> Tuple[Tuple[int, int, int, int, int, int], List[int]]:
+    min_x = min(dot.x for dot in dots)
+    min_y = min(dot.y for dot in dots)
+    max_x = max(dot.x + dot.w for dot in dots)
+    max_y = max(dot.y + dot.h for dot in dots)
+
+    pad_x = dot_diameter * 0.55
+    pad_y = dot_diameter * 0.55
+
+    anchor_x1 = min_x - pad_x
+    anchor_y1 = min_y - pad_y
+    anchor_x2 = max_x + pad_x
+    anchor_y2 = max_y + pad_y
+
+    min_anchor_width = dot_diameter * 2.6
+    min_anchor_height = dot_diameter * 4.0
+
+    current_width = anchor_x2 - anchor_x1
+    current_height = anchor_y2 - anchor_y1
+    if current_width < min_anchor_width:
+        width_delta = (min_anchor_width - current_width) / 2.0
+        anchor_x1 -= width_delta
+        anchor_x2 += width_delta
+    if current_height < min_anchor_height:
+        height_delta = (min_anchor_height - current_height) / 2.0
+        anchor_y1 -= height_delta
+        anchor_y2 += height_delta
+
+    x_edges = np.linspace(anchor_x1, anchor_x2, 3)
+    y_edges = np.linspace(anchor_y1, anchor_y2, 4)
+    pattern = [0, 0, 0, 0, 0, 0]
+
+    for col in range(2):
+        for row in range(3):
+            quadrant = (
+                float(x_edges[col]),
+                float(y_edges[row]),
+                float(x_edges[col + 1]),
+                float(y_edges[row + 1]),
+            )
+            if any(_intersects(dot, quadrant) for dot in dots):
+                pattern[row + col * 3] = 1
+
+    box = [
+        max(0, int(round(anchor_x1))),
+        max(0, int(round(anchor_y1))),
+        max(1, int(round(anchor_x2 - anchor_x1))),
+        max(1, int(round(anchor_y2 - anchor_y1))),
+    ]
+    return tuple(pattern), box
+
+
 def _build_cells(candidates: List[DotCandidate]) -> Tuple[str, float, List[List[int]]]:
-    if len(candidates) < 2:
+    if len(candidates) < 1:
         return "", 0.0, []
 
-    avg_width = float(np.mean([dot.w for dot in candidates]))
-    avg_height = float(np.mean([dot.h for dot in candidates]))
-    col_tolerance = max(avg_width * 0.8, 6.0)
-    row_tolerance = max(avg_height * 0.8, 6.0)
-
-    x_levels = _cluster_positions((dot.center[0] for dot in candidates), col_tolerance)
-    y_levels = _cluster_positions((dot.center[1] for dot in candidates), row_tolerance)
-    if len(x_levels) < 2 or len(y_levels) < 3:
+    dot_diameter = float(np.mean([max(dot.w, dot.h) for dot in candidates]))
+    cell_clusters = _cluster_cells(candidates, dot_diameter)
+    if not cell_clusters:
         return "", 0.0, []
 
-    horizontal_spacing = _estimate_spacing(x_levels, fallback=max(avg_width * 1.8, 12.0))
-    vertical_spacing = _estimate_spacing(y_levels, fallback=max(avg_height * 1.7, 12.0))
-    cell_width = max(horizontal_spacing * 2.2, avg_width * 2.5)
-    cell_height = max(vertical_spacing * 3.2, avg_height * 3.5)
+    line_threshold = max(dot_diameter * 4.0, 18.0)
+    sorted_clusters = sorted(
+        cell_clusters,
+        key=lambda cluster: (
+            min(dot.center[1] for dot in cluster),
+            min(dot.center[0] for dot in cluster),
+        ),
+    )
 
-    grouped_rows: List[List[float]] = []
-    for level in y_levels:
-        if not grouped_rows or abs(level - grouped_rows[-1][0]) > vertical_spacing * 2.0:
-            grouped_rows.append([level])
+    line_groups: List[List[List[DotCandidate]]] = []
+    for cluster in sorted_clusters:
+        cluster_top = min(dot.center[1] for dot in cluster)
+        if not line_groups:
+            line_groups.append([cluster])
+            continue
+
+        reference_top = median(
+            min(dot.center[1] for dot in member)
+            for member in line_groups[-1]
+        )
+        if abs(cluster_top - reference_top) <= line_threshold:
+            line_groups[-1].append(cluster)
         else:
-            grouped_rows[-1].append(level)
-    row_bases = [float(min(group)) for group in grouped_rows]
-
-    grouped_cols: List[List[float]] = []
-    for level in x_levels:
-        if not grouped_cols or abs(level - grouped_cols[-1][0]) > horizontal_spacing * 1.6:
-            grouped_cols.append([level])
-        else:
-            grouped_cols[-1].append(level)
-    col_bases = [float(min(group)) for group in grouped_cols]
-
-    cells: Dict[Tuple[int, int], List[DotCandidate]] = {}
-    cell_boxes: Dict[Tuple[int, int], List[int]] = {}
-
-    for dot in candidates:
-        cx, cy = dot.center
-        row_idx = min(range(len(row_bases)), key=lambda index: abs(cy - row_bases[index]))
-        col_idx = min(range(len(col_bases)), key=lambda index: abs(cx - col_bases[index]))
-        key = (row_idx, col_idx)
-        cells.setdefault(key, []).append(dot)
-
-        x1 = dot.x
-        y1 = dot.y
-        x2 = dot.x + dot.w
-        y2 = dot.y + dot.h
-        if key not in cell_boxes:
-            cell_boxes[key] = [x1, y1, x2, y2]
-        else:
-            cell_boxes[key][0] = min(cell_boxes[key][0], x1)
-            cell_boxes[key][1] = min(cell_boxes[key][1], y1)
-            cell_boxes[key][2] = max(cell_boxes[key][2], x2)
-            cell_boxes[key][3] = max(cell_boxes[key][3], y2)
+            line_groups.append([cluster])
 
     decoded_lines: List[str] = []
     confidences: List[float] = []
     ordered_boxes: List[List[int]] = []
 
-    for row_idx in sorted({key[0] for key in cells.keys()}):
-        row_keys = sorted((key for key in cells.keys() if key[0] == row_idx), key=lambda item: item[1])
-        if not row_keys:
-            continue
-
+    for line_clusters in line_groups:
+        line_clusters.sort(key=lambda cluster: min(dot.center[0] for dot in cluster))
         row_text = ""
-        previous_col: int | None = None
+        previous_right_edge: float | None = None
 
-        for key in row_keys:
-            current_col = key[1]
-            if previous_col is not None and current_col - previous_col > 1:
-                row_text += " "
-            previous_col = current_col
+        for cluster in line_clusters:
+            pattern, anchor_box = _quadrant_pattern(cluster, dot_diameter)
+            translated = GRADE_1_MAP.get(pattern, "?")
 
-            dots = cells[key]
-            base_x = col_bases[current_col]
-            base_y = row_bases[row_idx]
-            x_targets = [base_x, base_x + horizontal_spacing]
-            y_targets = [base_y, base_y + vertical_spacing, base_y + 2 * vertical_spacing]
+            cluster_left = min(dot.x for dot in cluster)
+            cluster_right = max(dot.x + dot.w for dot in cluster)
+            if previous_right_edge is not None:
+                if cluster_left - previous_right_edge > dot_diameter * 2.8:
+                    row_text += " "
+            previous_right_edge = cluster_right
 
-            pattern = [0, 0, 0, 0, 0, 0]
-            matched_positions: set[Tuple[int, int]] = set()
-
-            for dot in dots:
-                cx, cy = dot.center
-                col_slot = min(range(2), key=lambda index: abs(cx - x_targets[index]))
-                row_slot = min(range(3), key=lambda index: abs(cy - y_targets[index]))
-                pattern_index = row_slot + col_slot * 3
-                pattern[pattern_index] = 1
-                matched_positions.add((col_slot, row_slot))
-
-            pattern_tuple = tuple(pattern)
-            translated = GRADE_1_MAP.get(pattern_tuple, "?")
             row_text += translated
+            ordered_boxes.append(anchor_box)
 
-            occupancy_score = len(matched_positions) / 6.0
-            dictionary_score = 1.0 if translated != "?" else 0.35
-            geometry_score = float(np.mean([dot.circularity for dot in dots])) if dots else 0.0
-            cell_confidence = min(
+            occupancy_score = sum(pattern) / 6.0
+            dictionary_score = 1.0 if translated != "?" else 0.3
+            geometry_score = float(np.mean([dot.circularity for dot in cluster]))
+            cluster_confidence = min(
                 1.0,
                 0.2 + occupancy_score * 0.35 + dictionary_score * 0.25 + geometry_score * 0.2,
             )
-            confidences.append(cell_confidence)
+            confidences.append(cluster_confidence)
 
-            x1, y1, x2, y2 = cell_boxes[key]
-            padded_x1 = max(0, int(round(min(x1, base_x - avg_width * 0.6))))
-            padded_y1 = max(0, int(round(min(y1, base_y - avg_height * 0.6))))
-            padded_x2 = int(round(max(x2, base_x + cell_width)))
-            padded_y2 = int(round(max(y2, base_y + cell_height)))
-            ordered_boxes.append(
-                [padded_x1, padded_y1, max(1, padded_x2 - padded_x1), max(1, padded_y2 - padded_y1)]
-            )
-
-        if row_text.strip():
-            decoded_lines.append(row_text.strip())
+        cleaned = row_text.strip()
+        if cleaned:
+            decoded_lines.append(cleaned)
 
     text = "\n".join(decoded_lines).strip()
     if not text:
@@ -291,8 +347,10 @@ def process_braille_frame(frame: np.ndarray) -> Tuple[str, float, List[List[int]
 
     grayscale = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(grayscale, (5, 5), 0)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    normalized_contrast = clahe.apply(blurred)
     thresholded = cv2.adaptiveThreshold(
-        blurred,
+        normalized_contrast,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
