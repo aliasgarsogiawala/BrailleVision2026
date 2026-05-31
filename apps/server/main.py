@@ -14,7 +14,8 @@ app = FastAPI(title="BrailleVision API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000",
+                   "https://braille-vision2026-web.vercel.app",],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
