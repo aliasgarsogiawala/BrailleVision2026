@@ -21,12 +21,12 @@ app.add_middleware(
 )
 
 
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 480
-ROI_TOP_RATIO = 0.20
-ROI_BOTTOM_RATIO = 0.80
-ROI_LEFT_RATIO = 0.15
-ROI_RIGHT_RATIO = 0.85
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 720
+ROI_TOP_RATIO = 0.18
+ROI_BOTTOM_RATIO = 0.84
+ROI_LEFT_RATIO = 0.12
+ROI_RIGHT_RATIO = 0.88
 
 
 GRADE_1_MAP: Dict[Tuple[int, int, int, int, int, int], str] = {
@@ -129,7 +129,7 @@ def _extract_dot_candidates(binary: np.ndarray, grayscale: np.ndarray) -> List[D
 
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < 5 or area > 80:
+        if area < 15 or area > 240:
             continue
 
         perimeter = cv2.arcLength(contour, True)
@@ -197,8 +197,8 @@ def _cluster_cells(candidates: List[DotCandidate], dot_diameter: float) -> List[
     if not candidates:
         return []
 
-    horizontal_threshold = max(dot_diameter * 2.5, 10.0)
-    vertical_threshold = max(dot_diameter * 3.5, 14.0)
+    horizontal_threshold = max(dot_diameter * 2.5, 18.0)
+    vertical_threshold = max(dot_diameter * 3.5, 24.0)
     visited = [False] * len(candidates)
     clusters: List[List[DotCandidate]] = []
 
@@ -296,7 +296,7 @@ def _build_cells(candidates: List[DotCandidate]) -> Tuple[str, float, List[List[
     if not cell_clusters:
         return "", 0.0, []
 
-    line_threshold = max(dot_diameter * 4.0, 18.0)
+    line_threshold = max(dot_diameter * 4.0, 28.0)
     sorted_clusters = sorted(
         cell_clusters,
         key=lambda cluster: (
