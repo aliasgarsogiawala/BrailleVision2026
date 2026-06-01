@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
@@ -10,12 +11,25 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 
-app = FastAPI(title="BrailleVision API", version="2.0.0")
+def _cors_origins() -> List[str]:
+    raw = os.getenv("CORS_ORIGINS", "")
+    configured = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    defaults = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+    ordered: List[str] = []
+    for origin in [*configured, *defaults]:
+        if origin not in ordered:
+            ordered.append(origin)
+    return ordered
+
+
+app = FastAPI(title="BrailleVision API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000",
-                   "https://braille-vision2026-web.vercel.app"],
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -25,11 +39,10 @@ app.add_middleware(
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 ROI_SCALE = 0.70
-MIN_CONTOUR_AREA = 15.0
-MAX_CONTOUR_AREA = 350.0
-MIN_CIRCULARITY = 0.60
-MIN_ASPECT_RATIO = 0.70
-MAX_ASPECT_RATIO = 1.30
+ROW_BUCKET_TOLERANCE = 15.0
+MIN_CONTOUR_AREA = 12.0
+MAX_CONTOUR_AREA = 80.0
+MIN_SOLIDITY = 0.90
 
 
 GRADE_1_MAP: Dict[Tuple[int, int, int, int, int, int], str] = {
@@ -70,8 +83,7 @@ class DotCandidate:
     w: int
     h: int
     area: float
-    circularity: float
-    contrast: float
+    solidity: float
 
     @property
     def center(self) -> Tuple[float, float]:
@@ -108,12 +120,11 @@ def _encode_debug_image(mask: np.ndarray) -> str:
     success, encoded = cv2.imencode(".png", mask)
     if not success:
         return ""
-    data = base64.b64encode(encoded.tobytes()).decode("ascii")
-    return f"data:image/png;base64,{data}"
+    return f"data:image/png;base64,{base64.b64encode(encoded.tobytes()).decode('ascii')}"
 
 
-def _extract_dot_candidates(binary: np.ndarray, grayscale: np.ndarray) -> List[DotCandidate]:
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+def _extract_dot_candidates(mask: np.ndarray) -> List[DotCandidate]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candidates: List[DotCandidate] = []
 
     for contour in contours:
@@ -121,36 +132,18 @@ def _extract_dot_candidates(binary: np.ndarray, grayscale: np.ndarray) -> List[D
         if area < MIN_CONTOUR_AREA or area > MAX_CONTOUR_AREA:
             continue
 
-        perimeter = float(cv2.arcLength(contour, True))
-        if perimeter <= 0.0:
+        hull = cv2.convexHull(contour)
+        hull_area = float(cv2.contourArea(hull))
+        if hull_area <= 0.0:
             continue
 
-        circularity = float(4.0 * np.pi * area / (perimeter * perimeter))
-        if circularity < MIN_CIRCULARITY:
+        solidity = area / hull_area
+        if solidity <= MIN_SOLIDITY:
             continue
 
         x, y, w, h = cv2.boundingRect(contour)
-        if h <= 0 or w <= 0:
+        if w <= 0 or h <= 0:
             continue
-
-        aspect_ratio = float(w) / float(h)
-        if aspect_ratio < MIN_ASPECT_RATIO or aspect_ratio > MAX_ASPECT_RATIO:
-            continue
-
-        contour_mask = np.zeros(grayscale.shape, dtype=np.uint8)
-        cv2.drawContours(contour_mask, [contour], -1, 255, thickness=-1)
-        contour_pixels = grayscale[contour_mask == 255]
-        if contour_pixels.size == 0:
-            continue
-
-        outer_mask = np.zeros(grayscale.shape, dtype=np.uint8)
-        radius = max(4, int(max(w, h) * 1.8))
-        cv2.circle(outer_mask, (int(x + w / 2), int(y + h / 2)), radius, 255, thickness=-1)
-        ring_mask = cv2.subtract(outer_mask, contour_mask)
-        ring_pixels = grayscale[ring_mask == 255]
-        background_mean = float(np.mean(ring_pixels)) if ring_pixels.size else float(np.mean(grayscale))
-        foreground_mean = float(np.mean(contour_pixels))
-        contrast = max(0.0, background_mean - foreground_mean)
 
         candidates.append(
             DotCandidate(
@@ -159,133 +152,59 @@ def _extract_dot_candidates(binary: np.ndarray, grayscale: np.ndarray) -> List[D
                 w=int(w),
                 h=int(h),
                 area=area,
-                circularity=circularity,
-                contrast=contrast,
+                solidity=solidity,
             )
         )
 
-    candidates.sort(key=lambda dot: (dot.y, dot.x))
+    candidates.sort(key=lambda dot: (dot.center[1], dot.center[0]))
     return candidates
 
 
-def _cluster_dots(candidates: List[DotCandidate], diameter: float) -> List[List[DotCandidate]]:
+def _bucket_rows(candidates: List[DotCandidate]) -> List[List[DotCandidate]]:
     if not candidates:
         return []
 
-    horizontal_radius = max(3.5 * diameter, 18.0)
-    vertical_radius = max(4.0 * diameter, 28.0)
-    visited = [False] * len(candidates)
-    clusters: List[List[DotCandidate]] = []
-
-    for start in range(len(candidates)):
-        if visited[start]:
+    rows: List[List[DotCandidate]] = []
+    for candidate in candidates:
+        cy = candidate.center[1]
+        if not rows:
+            rows.append([candidate])
             continue
 
-        queue = [start]
-        visited[start] = True
-        cluster: List[DotCandidate] = []
+        placed = False
+        for row in rows:
+            reference_y = float(np.median([dot.center[1] for dot in row]))
+            if abs(cy - reference_y) <= ROW_BUCKET_TOLERANCE:
+                row.append(candidate)
+                placed = True
+                break
 
-        while queue:
-            current_index = queue.pop()
-            current = candidates[current_index]
-            cluster.append(current)
-            cx, cy = current.center
+        if not placed:
+            rows.append([candidate])
 
-            for neighbor_index, neighbor in enumerate(candidates):
-                if visited[neighbor_index]:
-                    continue
-
-                nx, ny = neighbor.center
-                if abs(nx - cx) <= horizontal_radius and abs(ny - cy) <= vertical_radius:
-                    visited[neighbor_index] = True
-                    queue.append(neighbor_index)
-
-        clusters.append(sorted(cluster, key=lambda dot: (dot.y, dot.x)))
-
-    return clusters
+    filtered = [sorted(row, key=lambda dot: dot.center[0]) for row in rows if len(row) >= 2]
+    filtered.sort(key=lambda row: float(np.median([dot.center[1] for dot in row])))
+    return filtered
 
 
-def _estimate_orientation(cluster: List[DotCandidate], diameter: float) -> Tuple[np.ndarray, np.ndarray]:
-    points = np.array([dot.center for dot in cluster], dtype=np.float32)
-    if len(points) < 2:
-        return np.array([1.0, 0.0], dtype=np.float32), np.array([0.0, 1.0], dtype=np.float32)
-
-    centered = points - np.mean(points, axis=0, keepdims=True)
-    covariance = np.cov(centered.T)
-    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-    major = eigenvectors[:, int(np.argmax(eigenvalues))]
-    major = major / (np.linalg.norm(major) + 1e-6)
-    if major[0] < 0:
-        major = -major
-
-    minor = np.array([-major[1], major[0]], dtype=np.float32)
-    if minor[1] < 0:
-        minor = -minor
-
-    horizontal_vectors: List[np.ndarray] = []
-    vertical_vectors: List[np.ndarray] = []
-    target = 2.5 * diameter
-
-    for left_index, left_dot in enumerate(cluster):
-        lx, ly = left_dot.center
-        for right_dot in cluster[left_index + 1 :]:
-            rx, ry = right_dot.center
-            vector = np.array([rx - lx, ry - ly], dtype=np.float32)
-            length = float(np.linalg.norm(vector))
-            if length < diameter or length > target * 1.8:
-                continue
-            unit = vector / (length + 1e-6)
-            if abs(float(np.dot(unit, major))) >= 0.7:
-                horizontal_vectors.append(unit if unit[0] >= 0 else -unit)
-            if abs(float(np.dot(unit, minor))) >= 0.7:
-                candidate = unit if unit[1] >= 0 else -unit
-                vertical_vectors.append(candidate)
-
-    if horizontal_vectors:
-        averaged = np.mean(horizontal_vectors, axis=0)
-        major = averaged / (np.linalg.norm(averaged) + 1e-6)
-    if vertical_vectors:
-        averaged = np.mean(vertical_vectors, axis=0)
-        minor = averaged / (np.linalg.norm(averaged) + 1e-6)
-    else:
-        minor = np.array([-major[1], major[0]], dtype=np.float32)
-        if minor[1] < 0:
-            minor = -minor
-
-    return major.astype(np.float32), minor.astype(np.float32)
+def _estimate_dot_scale(rows: List[List[DotCandidate]]) -> float:
+    diameters = [dot.diameter for row in rows for dot in row]
+    if not diameters:
+        return 8.0
+    return float(np.median(diameters))
 
 
-def _line_groups(clusters: List[List[DotCandidate]], diameter: float) -> List[List[List[DotCandidate]]]:
-    if not clusters:
-        return []
+def _estimate_horizontal_step(row: List[DotCandidate], diameter: float) -> float:
+    centers_x = [dot.center[0] for dot in row]
+    gaps = [centers_x[index + 1] - centers_x[index] for index in range(len(centers_x) - 1)]
+    valid = [gap for gap in gaps if gap > diameter * 0.6]
+    if not valid:
+        return max(diameter * 2.5, 18.0)
+    return float(np.median(valid))
 
-    sorted_clusters = sorted(
-        clusters,
-        key=lambda cluster: (
-            min(dot.center[1] for dot in cluster),
-            min(dot.center[0] for dot in cluster),
-        ),
-    )
-    threshold = max(4.2 * diameter, 34.0)
-    lines: List[List[List[DotCandidate]]] = []
 
-    for cluster in sorted_clusters:
-        cluster_top = float(min(dot.center[1] for dot in cluster))
-        if not lines:
-            lines.append([cluster])
-            continue
-
-        reference = float(
-            np.median([min(dot.center[1] for dot in existing) for existing in lines[-1]])
-        )
-        if abs(cluster_top - reference) <= threshold:
-            lines[-1].append(cluster)
-        else:
-            lines.append([cluster])
-
-    for line in lines:
-        line.sort(key=lambda cluster: min(dot.center[0] for dot in cluster))
-    return lines
+def _hamming_distance(a: Sequence[int], b: Sequence[int]) -> int:
+    return sum(int(left != right) for left, right in zip(a, b))
 
 
 def _match_pattern(pattern: Sequence[int]) -> Tuple[Tuple[int, int, int, int, int, int], str, int]:
@@ -293,102 +212,95 @@ def _match_pattern(pattern: Sequence[int]) -> Tuple[Tuple[int, int, int, int, in
     if pattern_tuple in GRADE_1_MAP:
         return pattern_tuple, GRADE_1_MAP[pattern_tuple], 0
 
-    best_pattern = min(
-        GRADE_1_MAP.keys(),
-        key=lambda candidate: sum(int(left != right) for left, right in zip(pattern_tuple, candidate)),
-    )
-    distance = sum(int(left != right) for left, right in zip(pattern_tuple, best_pattern))
-    return best_pattern, GRADE_1_MAP[best_pattern], distance
+    best = min(GRADE_1_MAP.keys(), key=lambda candidate: _hamming_distance(pattern_tuple, candidate))
+    return best, GRADE_1_MAP[best], _hamming_distance(pattern_tuple, best)
 
 
-def _decode_cluster(
-    cluster: List[DotCandidate],
-    diameter: float,
-) -> Tuple[str, float, List[int]]:
-    anchor_dot = min(cluster, key=lambda dot: (dot.y, dot.x))
-    anchor = np.array(anchor_dot.center, dtype=np.float32)
-    horizontal_axis, vertical_axis = _estimate_orientation(cluster, diameter)
-    step = 2.5 * diameter
-    match_radius = 1.45 * diameter
-
-    projected_points = [
-        anchor,
-        anchor + vertical_axis * step,
-        anchor + vertical_axis * (2.0 * step),
-        anchor + horizontal_axis * step,
-        anchor + horizontal_axis * step + vertical_axis * step,
-        anchor + horizontal_axis * step + vertical_axis * (2.0 * step),
+def _expected_points(cell_left: float, row_y: float, step: float) -> List[Tuple[float, float]]:
+    return [
+        (cell_left, row_y),
+        (cell_left, row_y + step),
+        (cell_left, row_y + 2.0 * step),
+        (cell_left + step, row_y),
+        (cell_left + step, row_y + step),
+        (cell_left + step, row_y + 2.0 * step),
     ]
 
+
+def _cell_pattern(
+    cell_left: float,
+    row_y: float,
+    dots: List[DotCandidate],
+    step: float,
+) -> Tuple[Tuple[int, int, int, int, int, int], str, int, List[int]]:
+    points = _expected_points(cell_left, row_y, step)
+    radius = max(step * 0.85, 10.0)
     pattern = [0, 0, 0, 0, 0, 0]
-    matched_indices: set[int] = set()
-    for node_index, target in enumerate(projected_points):
-        best_distance = float("inf")
-        best_candidate = -1
-        for candidate_index, dot in enumerate(cluster):
-            if candidate_index in matched_indices:
-                continue
-            center = np.array(dot.center, dtype=np.float32)
-            distance = float(np.linalg.norm(center - target))
-            if distance <= match_radius and distance < best_distance:
-                best_distance = distance
-                best_candidate = candidate_index
 
-        if best_candidate >= 0:
-            matched_indices.add(best_candidate)
-            pattern[node_index] = 1
+    for index, (px, py) in enumerate(points):
+        for dot in dots:
+            dx, dy = dot.center
+            if float(np.hypot(dx - px, dy - py)) <= radius:
+                pattern[index] = 1
+                break
 
-    matched_pattern, translated, hamming_distance = _match_pattern(pattern)
-    occupancy = sum(pattern) / 6.0
-    geometry = float(np.mean([dot.circularity for dot in cluster]))
-    contrast = min(1.0, float(np.mean([dot.contrast for dot in cluster])) / 28.0)
-    match_score = max(0.35, 1.0 - (hamming_distance / 6.0))
-    confidence = min(
-        1.0,
-        0.12 + occupancy * 0.28 + geometry * 0.22 + contrast * 0.2 + match_score * 0.18,
-    )
+    matched_pattern, translated, distance = _match_pattern(pattern)
 
-    xs = [dot.x for dot in cluster] + [int(point[0] - match_radius) for point in projected_points]
-    ys = [dot.y for dot in cluster] + [int(point[1] - match_radius) for point in projected_points]
-    xe = [dot.x + dot.w for dot in cluster] + [int(point[0] + match_radius) for point in projected_points]
-    ye = [dot.y + dot.h for dot in cluster] + [int(point[1] + match_radius) for point in projected_points]
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
     box = [
-        max(0, int(min(xs))),
-        max(0, int(min(ys))),
-        max(1, int(max(xe) - min(xs))),
-        max(1, int(max(ye) - min(ys))),
+        max(0, int(round(min(xs) - radius))),
+        max(0, int(round(min(ys) - radius))),
+        max(1, int(round((max(xs) - min(xs)) + (2.0 * radius)))),
+        max(1, int(round((max(ys) - min(ys)) + (2.0 * radius)))),
     ]
+    return matched_pattern, translated, distance, box
 
-    return translated, confidence, box
 
-
-def _decode_braille(candidates: List[DotCandidate]) -> Tuple[str, float, List[List[int]]]:
-    if not candidates:
+def _decode_rows(rows: List[List[DotCandidate]]) -> Tuple[str, float, List[List[int]]]:
+    if not rows:
         return "", 0.0, []
 
-    diameter = float(np.mean([dot.diameter for dot in candidates]))
-    clusters = _cluster_dots(candidates, diameter)
-    lines = _line_groups(clusters, diameter)
-
+    diameter = _estimate_dot_scale(rows)
     text_lines: List[str] = []
-    boxes: List[List[int]] = []
     confidences: List[float] = []
+    boxes: List[List[int]] = []
 
-    for line in lines:
+    for row in rows:
+        row_y = float(np.median([dot.center[1] for dot in row]))
+        step = max(_estimate_horizontal_step(row, diameter), diameter * 2.3)
+        starts = [row[0].center[0]]
+
+        for index in range(1, len(row)):
+            prev_x = row[index - 1].center[0]
+            curr_x = row[index].center[0]
+            gap = curr_x - prev_x
+            if gap > step * 1.6:
+                estimated_slots = max(1, int(round(gap / step)) - 1)
+                for slot in range(estimated_slots):
+                    starts.append(prev_x + step * (slot + 1))
+            starts.append(curr_x)
+
+        merged_starts: List[float] = []
+        for start in starts:
+            if not merged_starts or abs(start - merged_starts[-1]) > step * 0.55:
+                merged_starts.append(start)
+
         row_text = ""
-        previous_right: float | None = None
-
-        for cluster in line:
-            cluster_left = float(min(dot.x for dot in cluster))
-            cluster_right = float(max(dot.x + dot.w for dot in cluster))
-            if previous_right is not None and cluster_left - previous_right > diameter * 3.8:
+        previous_start: float | None = None
+        for start in merged_starts:
+            if previous_start is not None and start - previous_start > step * 1.8:
                 row_text += " "
 
-            translated, confidence, box = _decode_cluster(cluster, diameter)
+            matched_pattern, translated, distance, box = _cell_pattern(start, row_y, row, step)
             row_text += translated
             boxes.append(box)
+
+            occupancy = sum(matched_pattern) / 6.0
+            closeness = max(0.45, 1.0 - (distance / 6.0))
+            confidence = min(1.0, 0.18 + occupancy * 0.42 + closeness * 0.4)
             confidences.append(confidence)
-            previous_right = cluster_right
+            previous_start = start
 
         cleaned = row_text.strip()
         if cleaned:
@@ -408,22 +320,21 @@ def process_braille_frame(frame: np.ndarray) -> Tuple[str, float, List[List[int]
     grayscale = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
     equalized = clahe.apply(grayscale)
-    filtered = cv2.bilateralFilter(equalized, 9, 75, 75)
     thresholded = cv2.adaptiveThreshold(
-        filtered,
+        equalized,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
         101,
         2,
     )
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    reinforced = cv2.dilate(thresholded, kernel, iterations=1)
+    denoised = cv2.medianBlur(thresholded, 5)
 
-    candidates = _extract_dot_candidates(reinforced, filtered)
-    text, confidence, roi_boxes = _decode_braille(candidates)
+    candidates = _extract_dot_candidates(denoised)
+    rows = _bucket_rows(candidates)
+    text, confidence, roi_boxes = _decode_rows(rows)
     mapped_boxes = [[x + roi_left, y + roi_top, w, h] for x, y, w, h in roi_boxes]
-    debug_image = _encode_debug_image(reinforced)
+    debug_image = _encode_debug_image(denoised)
     return text, confidence, mapped_boxes, debug_image
 
 
