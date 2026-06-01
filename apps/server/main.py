@@ -7,8 +7,9 @@ from typing import Dict, List, Sequence, Tuple
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, Body, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 
 def _cors_origins() -> List[str]:
@@ -16,7 +17,7 @@ def _cors_origins() -> List[str]:
     configured = [origin.strip() for origin in raw.split(",") if origin.strip()]
     defaults = [
         "http://localhost:3000",
-        "http://127.0.0.1:3000",
+        "https://braille-vision2026-web.vercel.app",
     ]
     ordered: List[str] = []
     for origin in [*configured, *defaults]:
@@ -43,6 +44,7 @@ ROW_BUCKET_TOLERANCE = 15.0
 MIN_CONTOUR_AREA = 12.0
 MAX_CONTOUR_AREA = 80.0
 MIN_SOLIDITY = 0.90
+PAPER_BRIGHTNESS_FLOOR = 150
 
 
 GRADE_1_MAP: Dict[Tuple[int, int, int, int, int, int], str] = {
@@ -94,12 +96,35 @@ class DotCandidate:
         return float((self.w + self.h) / 2.0)
 
 
+class Base64ImagePayload(BaseModel):
+    image: str
+
+
 def _decode_image(raw_bytes: bytes) -> np.ndarray:
     matrix = np.frombuffer(raw_bytes, dtype=np.uint8)
     frame = cv2.imdecode(matrix, cv2.IMREAD_COLOR)
     if frame is None or frame.size == 0:
         raise HTTPException(status_code=400, detail="Unable to decode image frame.")
     return frame
+
+
+def _decode_base64_image(image_data: str) -> np.ndarray:
+    if not image_data or not image_data.strip():
+        raise HTTPException(status_code=400, detail="No Base64 image data was provided.")
+
+    encoded = image_data.strip()
+    if "," in encoded:
+        _, encoded = encoded.split(",", 1)
+
+    try:
+        raw_bytes = base64.b64decode(encoded, validate=True)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="Invalid Base64 image payload.") from exc
+
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Decoded Base64 image was empty.")
+
+    return _decode_image(raw_bytes)
 
 
 def _resize_frame(frame: np.ndarray) -> np.ndarray:
@@ -121,6 +146,47 @@ def _encode_debug_image(mask: np.ndarray) -> str:
     if not success:
         return ""
     return f"data:image/png;base64,{base64.b64encode(encoded.tobytes()).decode('ascii')}"
+
+
+def _paper_region_mask(grayscale: np.ndarray) -> np.ndarray:
+    blurred = cv2.GaussianBlur(grayscale, (7, 7), 0)
+    percentile_cutoff = int(np.percentile(blurred, 65))
+    threshold_value = max(PAPER_BRIGHTNESS_FLOOR, percentile_cutoff)
+    _, bright_mask = cv2.threshold(blurred, threshold_value, 255, cv2.THRESH_BINARY)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(bright_mask, connectivity=8)
+    if component_count <= 1:
+        return np.full_like(grayscale, 255)
+
+    frame_center = np.array([grayscale.shape[1] / 2.0, grayscale.shape[0] / 2.0], dtype=np.float32)
+    best_label = 0
+    best_score = -1.0
+
+    for label in range(1, component_count):
+        x, y, w, h, area = stats[label]
+        if area < grayscale.size * 0.02:
+            continue
+
+        center = np.array([x + (w / 2.0), y + (h / 2.0)], dtype=np.float32)
+        distance = float(np.linalg.norm(center - frame_center))
+        normalized_distance = 1.0 - min(1.0, distance / max(grayscale.shape))
+        fill_score = min(1.0, area / float(grayscale.size))
+        score = (fill_score * 0.65) + (normalized_distance * 0.35)
+        if score > best_score:
+            best_score = score
+            best_label = label
+
+    if best_label == 0:
+        return np.full_like(grayscale, 255)
+
+    selected = np.zeros_like(grayscale, dtype=np.uint8)
+    selected[labels == best_label] = 255
+    selected = cv2.dilate(selected, kernel, iterations=1)
+    return selected
 
 
 def _extract_dot_candidates(mask: np.ndarray) -> List[DotCandidate]:
@@ -318,6 +384,7 @@ def process_braille_frame(frame: np.ndarray) -> Tuple[str, float, List[List[int]
     roi = normalized[roi_top:roi_bottom, roi_left:roi_right]
 
     grayscale = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    paper_mask = _paper_region_mask(grayscale)
     clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
     equalized = clahe.apply(grayscale)
     thresholded = cv2.adaptiveThreshold(
@@ -329,6 +396,7 @@ def process_braille_frame(frame: np.ndarray) -> Tuple[str, float, List[List[int]
         2,
     )
     denoised = cv2.medianBlur(thresholded, 5)
+    denoised = cv2.bitwise_and(denoised, paper_mask)
 
     candidates = _extract_dot_candidates(denoised)
     rows = _bucket_rows(candidates)
@@ -338,9 +406,41 @@ def process_braille_frame(frame: np.ndarray) -> Tuple[str, float, List[List[int]
     return text, confidence, mapped_boxes, debug_image
 
 
+def _process_decoded_frame(frame: np.ndarray) -> Dict[str, object]:
+    text, confidence, boxes, debug_image = process_braille_frame(frame)
+    return {
+        "text": text,
+        "confidence": confidence,
+        "boxes": boxes,
+        "debug_image": debug_image,
+    }
+
+
 @app.get("/health")
 async def healthcheck() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/api/process-braille")
+async def process_braille_base64(payload: Base64ImagePayload = Body(...)) -> Dict[str, object]:
+    frame = _decode_base64_image(payload.image)
+    return _process_decoded_frame(frame)
+
+
+@app.post("/api/process-braille/upload")
+async def process_braille_upload(file: UploadFile = File(...)) -> Dict[str, object]:
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="No uploaded image data was provided.")
+
+    frame = _decode_image(raw)
+    return _process_decoded_frame(frame)
+
+
+@app.post("/api/process-braille/capture")
+async def process_braille_capture(payload: Base64ImagePayload = Body(...)) -> Dict[str, object]:
+    frame = _decode_base64_image(payload.image)
+    return _process_decoded_frame(frame)
 
 
 @app.post("/api/v1/process-frame")
@@ -350,10 +450,4 @@ async def process_frame(file: UploadFile = File(...)) -> Dict[str, object]:
         raise HTTPException(status_code=400, detail="Received empty frame.")
 
     frame = _decode_image(raw)
-    text, confidence, boxes, debug_image = process_braille_frame(frame)
-    return {
-        "text": text,
-        "confidence": confidence,
-        "boxes": boxes,
-        "debug_image": debug_image,
-    }
+    return _process_decoded_frame(frame)

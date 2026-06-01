@@ -1,5 +1,6 @@
 "use client";
 
+import type { ChangeEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 
 type VisionResponse = {
@@ -21,6 +22,7 @@ export function CameraVision() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const speakingTextRef = useRef("");
 
@@ -127,6 +129,37 @@ export function CameraVision() {
     });
   };
 
+  const roiBounds = () => {
+    const left = Math.round(PROCESS_WIDTH * (ROI_LEFT_PERCENT / 100));
+    const top = Math.round(PROCESS_HEIGHT * (ROI_TOP_PERCENT / 100));
+    const right = Math.round(PROCESS_WIDTH * (ROI_RIGHT_PERCENT / 100));
+    const bottom = Math.round(PROCESS_HEIGHT * (ROI_BOTTOM_PERCENT / 100));
+    return {
+      left,
+      top,
+      width: right - left,
+      height: bottom - top,
+    };
+  };
+
+  const processFormData = async (formData: FormData) => {
+    const response = await fetch(`${BACKEND_URL}/api/process-braille/upload`, {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Vision API error: ${response.status}`);
+    }
+
+    const data = (await response.json()) as VisionResponse;
+    setText(data.text || "No Braille detected");
+    setConfidence(data.confidence || 0);
+    setDebugImage(data.debug_image || "");
+    setStatus(data.text ? "Translation updated" : "No Braille found. Adjust lighting and try again.");
+    drawBoxes(data.boxes || []);
+  };
+
   const capturePhoto = async () => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
@@ -147,6 +180,16 @@ export function CameraVision() {
       }
 
       context.drawImage(video, 0, 0, PROCESS_WIDTH, PROCESS_HEIGHT);
+      const { left, top, width, height } = roiBounds();
+      const cropped = context.getImageData(left, top, width, height);
+
+      canvas.width = width;
+      canvas.height = height;
+      const croppedContext = canvas.getContext("2d");
+      if (!croppedContext) {
+        throw new Error("Canvas context unavailable after crop.");
+      }
+      croppedContext.putImageData(cropped, 0, 0);
 
       const blob = await new Promise<Blob | null>((resolve) => {
         canvas.toBlob(resolve, "image/jpeg", 0.95);
@@ -159,22 +202,7 @@ export function CameraVision() {
       setStatus("Sending photo to vision engine");
       const formData = new FormData();
       formData.append("file", blob, "capture.jpg");
-
-      const response = await fetch(`${BACKEND_URL}/api/v1/process-frame`, {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!response.ok) {
-        throw new Error(`Vision API error: ${response.status}`);
-      }
-
-      const data = (await response.json()) as VisionResponse;
-      setText(data.text || "No Braille detected");
-      setConfidence(data.confidence || 0);
-      setDebugImage(data.debug_image || "");
-      setStatus(data.text ? "Translation updated" : "No Braille found. Adjust lighting and capture again.");
-      drawBoxes(data.boxes || []);
+      await processFormData(formData);
     } catch (processingError) {
       const message =
         processingError instanceof Error
@@ -183,6 +211,37 @@ export function CameraVision() {
       setError(message);
       setStatus("Capture failed");
     } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleUploadClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    setIsProcessing(true);
+    setStatus("Uploading selected photo");
+    setError("");
+
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      await processFormData(formData);
+    } catch (processingError) {
+      const message =
+        processingError instanceof Error
+          ? processingError.message
+          : "Unable to process uploaded photo.";
+      setError(message);
+      setStatus("Upload failed");
+    } finally {
+      event.target.value = "";
       setIsProcessing(false);
     }
   };
@@ -231,14 +290,31 @@ export function CameraVision() {
               Translated Text
             </h2>
           </div>
-          <button
-            type="button"
-            onClick={() => void capturePhoto()}
-            disabled={!isCameraReady || isProcessing}
-            className="min-h-16 rounded-[1.4rem] border-4 border-ink bg-accent px-6 py-4 text-lg font-bold text-ink transition disabled:cursor-not-allowed disabled:bg-white disabled:text-ink/50"
-          >
-            {isProcessing ? "Capturing..." : "Capture & Translate"}
-          </button>
+          <div className="flex w-full flex-col gap-3 sm:w-auto">
+            <button
+              type="button"
+              onClick={() => void capturePhoto()}
+              disabled={!isCameraReady || isProcessing}
+              className="min-h-16 rounded-[1.4rem] border-4 border-ink bg-accent px-6 py-4 text-lg font-bold text-ink transition disabled:cursor-not-allowed disabled:bg-white disabled:text-ink/50"
+            >
+              {isProcessing ? "Processing..." : "Capture & Translate"}
+            </button>
+            <button
+              type="button"
+              onClick={handleUploadClick}
+              disabled={isProcessing}
+              className="min-h-14 rounded-[1.2rem] border-4 border-ink bg-white px-6 py-3 text-base font-bold text-ink transition disabled:cursor-not-allowed disabled:text-ink/50"
+            >
+              Upload Photo
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(event) => void handleFileChange(event)}
+            />
+          </div>
         </div>
 
         <div className="rounded-[1.5rem] border-4 border-ink bg-white p-5">
