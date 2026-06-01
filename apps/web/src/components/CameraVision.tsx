@@ -13,10 +13,10 @@ type VisionResponse = {
 const BACKEND_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const PROCESS_WIDTH = 1280;
 const PROCESS_HEIGHT = 720;
-const ROI_TOP_PERCENT = 15;
-const ROI_BOTTOM_PERCENT = 85;
-const ROI_LEFT_PERCENT = 15;
-const ROI_RIGHT_PERCENT = 85;
+const ROI_TOP_PERCENT = 20;
+const ROI_BOTTOM_PERCENT = 80;
+const ROI_LEFT_PERCENT = 20;
+const ROI_RIGHT_PERCENT = 80;
 
 export function CameraVision() {
   const videoRef = useRef<HTMLVideoElement | null>(null);

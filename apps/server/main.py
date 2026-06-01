@@ -39,12 +39,14 @@ app.add_middleware(
 
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
-ROI_SCALE = 0.70
+ROI_SCALE = 1.0
+INNER_PAPER_SCALE = 0.82
 ROW_BUCKET_TOLERANCE = 15.0
-MIN_CONTOUR_AREA = 12.0
-MAX_CONTOUR_AREA = 80.0
+MIN_CONTOUR_AREA = 18.0
+MAX_CONTOUR_AREA = 180.0
 MIN_SOLIDITY = 0.90
-PAPER_BRIGHTNESS_FLOOR = 150
+MIN_CIRCULARITY = 0.75
+MIN_CONTRAST = 10.0
 
 
 GRADE_1_MAP: Dict[Tuple[int, int, int, int, int, int], str] = {
@@ -86,6 +88,8 @@ class DotCandidate:
     h: int
     area: float
     solidity: float
+    circularity: float
+    contrast: float
 
     @property
     def center(self) -> Tuple[float, float]:
@@ -148,48 +152,21 @@ def _encode_debug_image(mask: np.ndarray) -> str:
     return f"data:image/png;base64,{base64.b64encode(encoded.tobytes()).decode('ascii')}"
 
 
-def _paper_region_mask(grayscale: np.ndarray) -> np.ndarray:
-    blurred = cv2.GaussianBlur(grayscale, (7, 7), 0)
-    percentile_cutoff = int(np.percentile(blurred, 65))
-    threshold_value = max(PAPER_BRIGHTNESS_FLOOR, percentile_cutoff)
-    _, bright_mask = cv2.threshold(blurred, threshold_value, 255, cv2.THRESH_BINARY)
+def _inner_focus_mask(grayscale: np.ndarray) -> np.ndarray:
+    height, width = grayscale.shape[:2]
+    focus_width = int(width * INNER_PAPER_SCALE)
+    focus_height = int(height * INNER_PAPER_SCALE)
+    left = max(0, (width - focus_width) // 2)
+    top = max(0, (height - focus_height) // 2)
+    right = min(width, left + focus_width)
+    bottom = min(height, top + focus_height)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(bright_mask, connectivity=8)
-    if component_count <= 1:
-        return np.full_like(grayscale, 255)
-
-    frame_center = np.array([grayscale.shape[1] / 2.0, grayscale.shape[0] / 2.0], dtype=np.float32)
-    best_label = 0
-    best_score = -1.0
-
-    for label in range(1, component_count):
-        x, y, w, h, area = stats[label]
-        if area < grayscale.size * 0.02:
-            continue
-
-        center = np.array([x + (w / 2.0), y + (h / 2.0)], dtype=np.float32)
-        distance = float(np.linalg.norm(center - frame_center))
-        normalized_distance = 1.0 - min(1.0, distance / max(grayscale.shape))
-        fill_score = min(1.0, area / float(grayscale.size))
-        score = (fill_score * 0.65) + (normalized_distance * 0.35)
-        if score > best_score:
-            best_score = score
-            best_label = label
-
-    if best_label == 0:
-        return np.full_like(grayscale, 255)
-
-    selected = np.zeros_like(grayscale, dtype=np.uint8)
-    selected[labels == best_label] = 255
-    selected = cv2.dilate(selected, kernel, iterations=1)
-    return selected
+    mask = np.zeros_like(grayscale, dtype=np.uint8)
+    mask[top:bottom, left:right] = 255
+    return mask
 
 
-def _extract_dot_candidates(mask: np.ndarray) -> List[DotCandidate]:
+def _extract_dot_candidates(mask: np.ndarray, grayscale: np.ndarray) -> List[DotCandidate]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candidates: List[DotCandidate] = []
 
@@ -207,8 +184,42 @@ def _extract_dot_candidates(mask: np.ndarray) -> List[DotCandidate]:
         if solidity <= MIN_SOLIDITY:
             continue
 
+        perimeter = float(cv2.arcLength(contour, True))
+        if perimeter <= 0.0:
+            continue
+
+        circularity = float(4.0 * np.pi * area / (perimeter * perimeter))
+        if circularity < MIN_CIRCULARITY:
+            continue
+
         x, y, w, h = cv2.boundingRect(contour)
         if w <= 0 or h <= 0:
+            continue
+
+        aspect_ratio = w / float(h)
+        if aspect_ratio < 0.8 or aspect_ratio > 1.25:
+            continue
+
+        contour_mask = np.zeros(grayscale.shape, dtype=np.uint8)
+        cv2.drawContours(contour_mask, [contour], -1, 255, thickness=-1)
+        contour_pixels = grayscale[contour_mask == 255]
+        if contour_pixels.size == 0:
+            continue
+
+        ring_mask = np.zeros(grayscale.shape, dtype=np.uint8)
+        cv2.circle(
+            ring_mask,
+            (int(x + w / 2), int(y + h / 2)),
+            max(4, int(max(w, h) * 1.8)),
+            255,
+            thickness=-1,
+        )
+        ring_mask = cv2.subtract(ring_mask, contour_mask)
+        ring_pixels = grayscale[ring_mask == 255]
+        background_mean = float(np.mean(ring_pixels)) if ring_pixels.size else float(np.mean(grayscale))
+        foreground_mean = float(np.mean(contour_pixels))
+        contrast = max(0.0, background_mean - foreground_mean)
+        if contrast < MIN_CONTRAST:
             continue
 
         candidates.append(
@@ -219,11 +230,44 @@ def _extract_dot_candidates(mask: np.ndarray) -> List[DotCandidate]:
                 h=int(h),
                 area=area,
                 solidity=solidity,
+                circularity=circularity,
+                contrast=contrast,
             )
         )
 
     candidates.sort(key=lambda dot: (dot.center[1], dot.center[0]))
     return candidates
+
+
+def _refine_candidates(candidates: List[DotCandidate]) -> List[DotCandidate]:
+    if len(candidates) < 2:
+        return []
+
+    diameters = np.array([dot.diameter for dot in candidates], dtype=np.float32)
+    areas = np.array([dot.area for dot in candidates], dtype=np.float32)
+    median_diameter = float(np.median(diameters))
+    median_area = float(np.median(areas))
+
+    filtered: List[DotCandidate] = []
+    for dot in candidates:
+        if dot.diameter < median_diameter * 0.7 or dot.diameter > median_diameter * 1.6:
+            continue
+        if dot.area < median_area * 0.45 or dot.area > median_area * 2.2:
+            continue
+
+        neighbor_count = 0
+        cx, cy = dot.center
+        for other in candidates:
+            if other is dot:
+                continue
+            ox, oy = other.center
+            if abs(ox - cx) <= median_diameter * 3.5 and abs(oy - cy) <= median_diameter * 1.6:
+                neighbor_count += 1
+        if neighbor_count >= 1:
+            filtered.append(dot)
+
+    filtered.sort(key=lambda dot: (dot.center[1], dot.center[0]))
+    return filtered
 
 
 def _bucket_rows(candidates: List[DotCandidate]) -> List[List[DotCandidate]]:
@@ -248,9 +292,30 @@ def _bucket_rows(candidates: List[DotCandidate]) -> List[List[DotCandidate]]:
         if not placed:
             rows.append([candidate])
 
-    filtered = [sorted(row, key=lambda dot: dot.center[0]) for row in rows if len(row) >= 2]
-    filtered.sort(key=lambda row: float(np.median([dot.center[1] for dot in row])))
-    return filtered
+    filtered_rows: List[List[DotCandidate]] = []
+    for row in rows:
+        if len(row) < 2:
+            continue
+
+        ordered = sorted(row, key=lambda dot: dot.center[0])
+        row_diameter = float(np.median([dot.diameter for dot in ordered]))
+        max_gap = max(row_diameter * 4.2, 48.0)
+
+        current_segment: List[DotCandidate] = [ordered[0]]
+        for dot in ordered[1:]:
+            prev = current_segment[-1]
+            if dot.center[0] - prev.center[0] > max_gap:
+                if len(current_segment) >= 2:
+                    filtered_rows.append(current_segment)
+                current_segment = [dot]
+            else:
+                current_segment.append(dot)
+
+        if len(current_segment) >= 2:
+            filtered_rows.append(current_segment)
+
+    filtered_rows.sort(key=lambda row: float(np.median([dot.center[1] for dot in row])))
+    return filtered_rows
 
 
 def _estimate_dot_scale(rows: List[List[DotCandidate]]) -> float:
@@ -384,25 +449,50 @@ def process_braille_frame(frame: np.ndarray) -> Tuple[str, float, List[List[int]
     roi = normalized[roi_top:roi_bottom, roi_left:roi_right]
 
     grayscale = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    paper_mask = _paper_region_mask(grayscale)
+    paper_mask = _inner_focus_mask(grayscale)
     clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
     equalized = clahe.apply(grayscale)
+    filtered = cv2.bilateralFilter(equalized, 7, 40, 40)
     thresholded = cv2.adaptiveThreshold(
-        equalized,
+        filtered,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
-        101,
-        2,
+        91,
+        3,
     )
-    denoised = cv2.medianBlur(thresholded, 5)
-    denoised = cv2.bitwise_and(denoised, paper_mask)
 
-    candidates = _extract_dot_candidates(denoised)
+    blackhat_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    blackhat = cv2.morphologyEx(filtered, cv2.MORPH_BLACKHAT, blackhat_kernel)
+    blackhat = cv2.GaussianBlur(blackhat, (5, 5), 0)
+    _, blackhat_mask = cv2.threshold(
+        blackhat,
+        int(max(10, np.percentile(blackhat, 84))),
+        255,
+        cv2.THRESH_BINARY,
+    )
+
+    combined = cv2.bitwise_and(thresholded, blackhat_mask)
+    combined = cv2.bitwise_and(combined, paper_mask)
+    combined = cv2.medianBlur(combined, 3)
+    combined = cv2.morphologyEx(
+        combined,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    combined = cv2.morphologyEx(
+        combined,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+
+    candidates = _refine_candidates(_extract_dot_candidates(combined, filtered))
     rows = _bucket_rows(candidates)
     text, confidence, roi_boxes = _decode_rows(rows)
     mapped_boxes = [[x + roi_left, y + roi_top, w, h] for x, y, w, h in roi_boxes]
-    debug_image = _encode_debug_image(denoised)
+    debug_image = _encode_debug_image(combined)
     return text, confidence, mapped_boxes, debug_image
 
 
